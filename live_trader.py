@@ -23,6 +23,14 @@ MAX_USE = D("10")
 SAFE_MIN_ORDER_AMOUNT = D("2")
 
 
+class NoFillError(RuntimeError):
+    """两边订单都没有成交，可以安全等待下一轮重试。"""
+
+
+class UnequalFillError(RuntimeError):
+    """两边成交数量不一致，必须熔断人工核对。"""
+
+
 class TelegramNotifier:
     def __init__(self) -> None:
         self.token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -336,9 +344,10 @@ def checked_pair(clients: dict[str, Any], buy_exchange: str, sell_exchange: str,
         journal_order(db, sell_exchange, "sell", "cancel", sell_cancel, amount, sell_price)
         if buy_filled != sell_filled:
             print(f"订单状态原始响应：{buy_exchange}={json.dumps(buy_status, ensure_ascii=False, default=str)} | {sell_exchange}={json.dumps(sell_status, ensure_ascii=False, default=str)}")
-            raise RuntimeError(f"两边成交数量不一致：买入={buy_filled}，卖出={sell_filled}；未成交部分已尝试撤销，策略已停止")
+            raise UnequalFillError(f"两边成交数量不一致：买入={buy_filled}，卖出={sell_filled}；未成交部分已尝试撤销，策略已停止")
         if buy_filled <= 0:
-            raise RuntimeError("两边订单均未成交，策略已停止")
+            print(f"订单状态原始响应：{buy_exchange}={json.dumps(buy_status, ensure_ascii=False, default=str)} | {sell_exchange}={json.dumps(sell_status, ensure_ascii=False, default=str)}")
+            raise NoFillError("两边订单均未成交，已撤销剩余部分，本轮安全重试")
         return buy_filled, fill_price(buy_status, buy_price), sell_filled, fill_price(sell_status, sell_price), buy_result, sell_result
     except Exception:
         if buy_result is not None:
@@ -459,6 +468,12 @@ def _run_live_once(args: Any, preflight_only: bool = False, notifier: TelegramNo
             print(f"真实统一再平衡：数量={total_amount}，预计利润={estimated} USDT")
             try:
                 filled_buy, actual_buy_price, filled_sell, actual_sell_price, buy_result, sell_result = checked_pair(clients, rebuy_exchange, resell_exchange, total_amount, rebuy_price, resell_price, db)
+            except NoFillError as exc:
+                print(f"再平衡本轮未成交：{exc}；保留活动周期，下一轮继续尝试")
+                if notifier:
+                    notifier.send(f"再平衡未成交\n原因：{exc}\n保留活动周期，下一轮继续尝试")
+                db.db.close()
+                return
             except Exception as exc:
                 save_live_state(db, active, True)
                 db.db.close()
@@ -474,6 +489,7 @@ def _run_live_once(args: Any, preflight_only: bool = False, notifier: TelegramNo
             total_profit = sum((D(c["amount"]) * (D(c["entry_sell_price"]) * (D("1") - args.fee) - D(c["entry_buy_price"]) * (D("1") + args.fee) + actual_sell_price * (D("1") - args.fee) - actual_buy_price * (D("1") + args.fee)) for c in active), D("0"))
             settled_count = len(active)
             save_live_state(db, [], False)
+            db.save_state("live_recovery", False)
             print(f"真实再平衡完成：已结算 {settled_count} 个周期")
             if notifier:
                 notifier.send(f"套利周期完成\n结算周期：{settled_count}\n本次利润：{total_profit} USDT\n两边库存已再平衡")
@@ -485,10 +501,28 @@ def _run_live_once(args: Any, preflight_only: bool = False, notifier: TelegramNo
             print(f"真实模式等待：反向绝对价差={reverse_spread}，预计利润={estimated}")
             db.db.close()
             return
+    # 入场下单前重新读取 Gate 深度，避免使用旧的买一价格和数量。
+    gate = market.gate_book()
+    if buy_exchange == "Gate":
+        buy_price = gate.asks[0].price
+    if sell_exchange == "Gate":
+        sell_price = gate.bids[0].price
+    spread = sell_price - buy_price
+    if spread <= args.trigger_spread:
+        print(f"下单前 Gate 深度刷新后价差为 {spread}，低于入场阈值 {args.trigger_spread}，本轮不下单")
+        db.db.close()
+        return
     capped_base = min(MAX_USE, balances[sell_exchange]["PEARL"])
     capped_quote = min(MAX_USE, balances[buy_exchange]["USDT"])
     # 买入需要额外支付手续费，不能只用 USDT / price 计算，否则交易所会因余额不足拒单。
     amount = min(args.amount, capped_base, capped_quote / (buy_price * (D("1") + args.fee)))
+    if active and amount < args.amount:
+        db.save_state("live_recovery", True)
+        print(f"库存恢复模式：当前可用数量仅 {amount} PEARL，无法支持完整 {args.amount} PEARL 双边套利；等待反向价差 <= {args.rebalance_spread} 且预计利润 > 0 后恢复库存")
+        if notifier:
+            notifier.send(f"进入库存恢复模式\n当前可用数量：{amount} PEARL\n目标交易数量：{args.amount} PEARL\n等待反向价差 <= {args.rebalance_spread} 且预计利润 > 0")
+        db.db.close()
+        return
     if amount <= 0:
         if active:
             print("追加入场跳过：当前可用余额不足，保留已有周期等待再平衡")
@@ -512,6 +546,12 @@ def _run_live_once(args: Any, preflight_only: bool = False, notifier: TelegramNo
     print(f"准备真实 IOC 限价双边下单：{buy_exchange} 买入 {amount} @ {buy_price}；{sell_exchange} 卖出 {amount} @ {sell_price}")
     try:
         filled_buy, actual_buy_price, filled_sell, actual_sell_price, buy_result, sell_result = checked_pair(clients, buy_exchange, sell_exchange, amount, buy_price, sell_price, db)
+    except NoFillError as exc:
+        print(f"本轮双边订单均未成交：{exc}；下一轮继续尝试")
+        if notifier:
+            notifier.send(f"本轮套利未成交\n原因：{exc}\n下一轮继续尝试")
+        db.db.close()
+        return
     except Exception as exc:
         # 已有活动周期时，余额不足只表示本轮无法追加，不应熔断已有周期。
         if active and "insufficient_balance" in str(exc).lower():
