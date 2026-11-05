@@ -27,6 +27,8 @@ class TelegramNotifier:
     def __init__(self) -> None:
         self.token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         self.chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+        if not self.token or not self.chat_id:
+            print("Telegram 通知未启用：VPS 的 .env 缺少 TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID")
 
     def send(self, message: str) -> None:
         if not self.token or not self.chat_id:
@@ -38,8 +40,13 @@ class TelegramNotifier:
                 timeout=10,
             )
             response.raise_for_status()
+            payload = response.json()
+            if payload.get("ok") is not True:
+                raise RuntimeError(payload.get("description", "Telegram API 返回失败"))
         except requests.RequestException as exc:
             print(f"Telegram 通知发送失败：{exc}")
+        except (ValueError, RuntimeError) as exc:
+            print(f"Telegram API 返回失败：{exc}")
 
 
 def amount_of(rows: Any, currency: str, field: str) -> Decimal:
@@ -480,11 +487,20 @@ def _run_live_once(args: Any, preflight_only: bool = False, notifier: TelegramNo
             return
     capped_base = min(MAX_USE, balances[sell_exchange]["PEARL"])
     capped_quote = min(MAX_USE, balances[buy_exchange]["USDT"])
-    amount = min(args.amount, capped_base, capped_quote / buy_price)
+    # 买入需要额外支付手续费，不能只用 USDT / price 计算，否则交易所会因余额不足拒单。
+    amount = min(args.amount, capped_base, capped_quote / (buy_price * (D("1") + args.fee)))
     if amount <= 0:
+        if active:
+            print("追加入场跳过：当前可用余额不足，保留已有周期等待再平衡")
+            db.db.close()
+            return
         db.db.close()
         raise RuntimeError("按 10 PEARL/10 USDT 使用上限计算后，可下单数量为 0")
     if amount < SAFE_MIN_ORDER_AMOUNT:
+        if active:
+            print(f"追加入场跳过：可用数量 {amount} 小于最小下单量 {SAFE_MIN_ORDER_AMOUNT}，保留已有周期等待再平衡")
+            db.db.close()
+            return
         db.db.close()
         raise RuntimeError(f"可下单数量 {amount} PEARL 小于 SafeTrade 最小下单量 {SAFE_MIN_ORDER_AMOUNT} PEARL，未提交订单")
     buy_book = gate if buy_exchange == "Gate" else safe
@@ -497,6 +513,11 @@ def _run_live_once(args: Any, preflight_only: bool = False, notifier: TelegramNo
     try:
         filled_buy, actual_buy_price, filled_sell, actual_sell_price, buy_result, sell_result = checked_pair(clients, buy_exchange, sell_exchange, amount, buy_price, sell_price, db)
     except Exception as exc:
+        # 已有活动周期时，余额不足只表示本轮无法追加，不应熔断已有周期。
+        if active and "insufficient_balance" in str(exc).lower():
+            print(f"追加入场跳过：{exc}；保留已有周期，等待反向价差再平衡")
+            db.db.close()
+            return
         save_live_state(db, active, True)
         db.db.close()
         raise RuntimeError(f"入场订单请求出现网络或交易所异常，策略已熔断；原始错误：{exc}；请先核对两边订单和余额") from exc
