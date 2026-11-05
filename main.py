@@ -261,7 +261,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Paper-only SafeTrade/Gate PEARL arbitrage")
     parser.add_argument("--interval", type=float, default=5)
     parser.add_argument("--amount", type=Decimal, default=D(os.getenv("PAPER_ORDER_AMOUNT", "4.5")))
-    parser.add_argument("--trigger-spread", type=Decimal, default=D("0.005"))
+    parser.add_argument("--trigger-spread", type=Decimal, default=D("0.01"))
     parser.add_argument("--rebalance-spread", type=Decimal, default=D("0.002"))
     parser.add_argument("--initial-prl", type=Decimal, default=D("10"))
     parser.add_argument("--initial-usdt", type=Decimal, default=D("10"))

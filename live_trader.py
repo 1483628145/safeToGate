@@ -23,6 +23,25 @@ MAX_USE = D("10")
 SAFE_MIN_ORDER_AMOUNT = D("2")
 
 
+class TelegramNotifier:
+    def __init__(self) -> None:
+        self.token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+        self.chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+
+    def send(self, message: str) -> None:
+        if not self.token or not self.chat_id:
+            return
+        try:
+            response = requests.post(
+                f"https://api.telegram.org/bot{self.token}/sendMessage",
+                json={"chat_id": self.chat_id, "text": message},
+                timeout=10,
+            )
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            print(f"Telegram 通知发送失败：{exc}")
+
+
 def amount_of(rows: Any, currency: str, field: str) -> Decimal:
     currency = currency.lower()
     for row in rows or []:
@@ -338,7 +357,7 @@ def log_live_orders(db: PaperDB, buy_result: Any, sell_result: Any, buy_exchange
     db.db.commit()
 
 
-def _run_live_once(args: Any, preflight_only: bool = False) -> None:
+def _run_live_once(args: Any, preflight_only: bool = False, notifier: TelegramNotifier | None = None) -> None:
     def new_session() -> requests.Session:
         session = requests.Session()
         session.trust_env = True
@@ -355,6 +374,9 @@ def _run_live_once(args: Any, preflight_only: bool = False) -> None:
     }
     if not all(client.key and client.secret for client in clients.values()):
         raise RuntimeError("SafeTrade 和 Gate 都必须配置 API Key/Secret")
+    state_db = PaperDB(args.db)
+    has_active_cycle = bool(state_db.state("live_active"))
+    state_db.db.close()
     if not preflight_only and not getattr(args, "live_reset_halt", False):
         guard_db = PaperDB(args.db)
         if bool(guard_db.state("live_halted")):
@@ -373,7 +395,8 @@ def _run_live_once(args: Any, preflight_only: bool = False) -> None:
             return
         raise
     try:
-        assert_start_balances(balances)
+        if not has_active_cycle:
+            assert_start_balances(balances)
     except RuntimeError as exc:
         if preflight_only:
             print(f"余额：SafeTrade PEARL={balances['SafeTrade']['PEARL']} USDT={balances['SafeTrade']['USDT']} | Gate PEARL={balances['Gate']['PEARL']} USDT={balances['Gate']['USDT']}")
@@ -441,9 +464,12 @@ def _run_live_once(args: Any, preflight_only: bool = False) -> None:
                 amount = D(cycle["amount"])
                 profit = amount * (D(cycle["entry_sell_price"]) * (D("1") - args.fee) - D(cycle["entry_buy_price"]) * (D("1") + args.fee) + actual_sell_price * (D("1") - args.fee) - actual_buy_price * (D("1") + args.fee))
                 db.finish_cycle(int(cycle["id"]), reverse_spread, actual_buy_price, actual_sell_price, args.fee, profit)
+            total_profit = sum((D(c["amount"]) * (D(c["entry_sell_price"]) * (D("1") - args.fee) - D(c["entry_buy_price"]) * (D("1") + args.fee) + actual_sell_price * (D("1") - args.fee) - actual_buy_price * (D("1") + args.fee)) for c in active), D("0"))
             settled_count = len(active)
             save_live_state(db, [], False)
             print(f"真实再平衡完成：已结算 {settled_count} 个周期")
+            if notifier:
+                notifier.send(f"套利周期完成\n结算周期：{settled_count}\n本次利润：{total_profit} USDT\n两边库存已再平衡")
             db.db.close()
             return
         if direction == first["direction"] and spread > args.trigger_spread and len(active) < args.max_open_entries:
@@ -482,22 +508,31 @@ def _run_live_once(args: Any, preflight_only: bool = False) -> None:
     cycle_id = db.start_cycle(direction, filled_buy, spread, actual_buy_price, actual_sell_price, args.fee)
     active.append({"id": cycle_id, "direction": direction, "amount": str(filled_buy), "buy_exchange": buy_exchange, "sell_exchange": sell_exchange, "entry_buy_price": str(actual_buy_price), "entry_sell_price": str(actual_sell_price)})
     save_live_state(db, active, False)
+    entry_estimate = filled_buy * (actual_sell_price * (D("1") - args.fee) - actual_buy_price * (D("1") + args.fee))
+    if notifier:
+        notifier.send(f"套利入场成功\n买入：{buy_exchange} {filled_buy} PEARL @ {actual_buy_price}\n卖出：{sell_exchange} {filled_sell} PEARL @ {actual_sell_price}\n本阶段预计收益：{entry_estimate} USDT\n等待反向价差 <= {args.rebalance_spread} 再平衡")
     print(f"真实入场完成：买入 {filled_buy} @ {actual_buy_price}，卖出 {filled_sell} @ {actual_sell_price}；已开周期={len(active)}")
     db.db.close()
 
 
 def run_live(args: Any, preflight_only: bool = False) -> None:
+    notifier = TelegramNotifier()
+    notifier.send("套利程序已启动\n模式：只读预检" if preflight_only else "套利程序已启动\n模式：真实交易")
     if preflight_only:
-        _run_live_once(args, preflight_only=True)
+        try:
+            _run_live_once(args, preflight_only=True, notifier=notifier)
+        finally:
+            notifier.send("套利程序已停止\n预检结束，未提交订单")
         return
     try:
         while True:
             try:
-                _run_live_once(args, preflight_only=False)
+                _run_live_once(args, preflight_only=False, notifier=notifier)
             except (requests.RequestException, RuntimeError, ValueError, ArithmeticError) as exc:
                 print(f"真实模式错误：{exc}")
+                notifier.send(f"套利失败\n原因：{exc}")
                 message = str(exc)
-                if any(token in message for token in ("熔断", "已因单边成交", "nonce_expired", "ConnectionResetError", "SafeTrade unavailable")):
+                if any(token in message for token in ("熔断", "已因单边成交", "真实余额未达到", "nonce_expired", "ConnectionResetError", "SafeTrade unavailable")):
                     break
             if getattr(args, "once", False):
                 break
@@ -505,3 +540,5 @@ def run_live(args: Any, preflight_only: bool = False) -> None:
     except KeyboardInterrupt:
         print("\n真实模式已停止；未自动补仓或提交额外订单。")
 
+    finally:
+        notifier.send("套利程序已停止\n未自动补仓，程序已退出")
