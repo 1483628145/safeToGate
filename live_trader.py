@@ -459,6 +459,20 @@ def _run_live_once(args: Any, preflight_only: bool = False, notifier: TelegramNo
             if total_amount < SAFE_MIN_ORDER_AMOUNT:
                 db.db.close()
                 raise RuntimeError(f"再平衡数量 {total_amount} PEARL 小于 SafeTrade 最小下单量 {SAFE_MIN_ORDER_AMOUNT} PEARL，未提交订单")
+            if total_amount > MAX_USE:
+                print(f"再平衡等待：活动周期总数量 {total_amount} 超过单次上限 {MAX_USE}，不会拆分结算")
+                db.db.close()
+                return
+            max_sellable = max(D("0"), balances[resell_exchange]["PEARL"] - MIN_BALANCE)
+            quote_after_reserve = balances[rebuy_exchange]["USDT"] - MIN_BALANCE
+            max_buyable = max(D("0"), quote_after_reserve / (rebuy_price * (D("1") + args.fee)))
+            if max_sellable < total_amount or max_buyable < total_amount:
+                db.save_state("live_recovery", True)
+                print(f"再平衡等待：完整结算 {total_amount} PEARL 会低于余额保留线；可卖={max_sellable}，可买={max_buyable}，需要={total_amount}")
+                if notifier:
+                    notifier.send(f"再平衡暂缓\n完整结算数量：{total_amount} PEARL\n安全可卖：{max_sellable}\n安全可买：{max_buyable}\n原因：交易后会低于 9 PEARL/9 USDT 保留线")
+                db.db.close()
+                return
             rebuy_book = gate if rebuy_exchange == "Gate" else safe
             resell_book = gate if resell_exchange == "Gate" else safe
             if rebuy_book.asks[0].amount < total_amount or resell_book.bids[0].amount < total_amount:
