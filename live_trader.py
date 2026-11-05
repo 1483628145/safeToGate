@@ -309,6 +309,7 @@ def checked_pair(clients: dict[str, Any], buy_exchange: str, sell_exchange: str,
         journal_order(db, buy_exchange, "buy", "cancel", buy_cancel, amount, buy_price)
         journal_order(db, sell_exchange, "sell", "cancel", sell_cancel, amount, sell_price)
         if buy_filled != sell_filled:
+            print(f"订单状态原始响应：{buy_exchange}={json.dumps(buy_status, ensure_ascii=False, default=str)} | {sell_exchange}={json.dumps(sell_status, ensure_ascii=False, default=str)}")
             raise RuntimeError(f"两边成交数量不一致：买入={buy_filled}，卖出={sell_filled}；未成交部分已尝试撤销，策略已停止")
         if buy_filled <= 0:
             raise RuntimeError("两边订单均未成交，策略已停止")
@@ -419,6 +420,12 @@ def _run_live_once(args: Any, preflight_only: bool = False) -> None:
             if total_amount < SAFE_MIN_ORDER_AMOUNT:
                 db.db.close()
                 raise RuntimeError(f"再平衡数量 {total_amount} PEARL 小于 SafeTrade 最小下单量 {SAFE_MIN_ORDER_AMOUNT} PEARL，未提交订单")
+            rebuy_book = gate if rebuy_exchange == "Gate" else safe
+            resell_book = gate if resell_exchange == "Gate" else safe
+            if rebuy_book.asks[0].amount < total_amount or resell_book.bids[0].amount < total_amount:
+                print(f"再平衡取消：盘口一档数量不足，买方可买={rebuy_book.asks[0].amount}，卖方可卖={resell_book.bids[0].amount}，需要={total_amount}")
+                db.db.close()
+                return
             print(f"真实统一再平衡：数量={total_amount}，预计利润={estimated} USDT")
             try:
                 filled_buy, actual_buy_price, filled_sell, actual_sell_price, buy_result, sell_result = checked_pair(clients, rebuy_exchange, resell_exchange, total_amount, rebuy_price, resell_price, db)
@@ -454,6 +461,12 @@ def _run_live_once(args: Any, preflight_only: bool = False) -> None:
     if amount < SAFE_MIN_ORDER_AMOUNT:
         db.db.close()
         raise RuntimeError(f"可下单数量 {amount} PEARL 小于 SafeTrade 最小下单量 {SAFE_MIN_ORDER_AMOUNT} PEARL，未提交订单")
+    buy_book = gate if buy_exchange == "Gate" else safe
+    sell_book = gate if sell_exchange == "Gate" else safe
+    if buy_book.asks[0].amount < amount or sell_book.bids[0].amount < amount:
+        print(f"入场取消：盘口一档数量不足，买方可买={buy_book.asks[0].amount}，卖方可卖={sell_book.bids[0].amount}，需要={amount}")
+        db.db.close()
+        return
     print(f"准备真实 IOC 限价双边下单：{buy_exchange} 买入 {amount} @ {buy_price}；{sell_exchange} 卖出 {amount} @ {sell_price}")
     try:
         filled_buy, actual_buy_price, filled_sell, actual_sell_price, buy_result, sell_result = checked_pair(clients, buy_exchange, sell_exchange, amount, buy_price, sell_price, db)
